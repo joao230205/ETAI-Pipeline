@@ -1,4 +1,7 @@
 # Baseline Predictive Pipeline -- ETAI
+20260548 - João Fernandes
+week 2 
+The best model is the logistic regression because it has better prevision capabilities without overfitting
 
 This is the **starting point** for your semester project: a small but *complete* predictive pipeline -- every piece a real project needs (entry point, config, data loading, preprocessing, model, evaluation), just kept as simple as possible for now.
 
