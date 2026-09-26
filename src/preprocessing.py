@@ -1,14 +1,18 @@
 """
-Preprocessing -- deliberately minimal for week 2.
+Preprocessing -- turns a dataframe (raw or already run through
+src/cleaning.py) into train/test splits ready for a model:
+    - keeps only the configured feature columns (see config.yaml's
+      "features" list and its comments for why each excluded column is excluded)
+    - drops rows still missing a value in a feature or the target (on the
+      "raw" / naive path this is the only missing-value handling at all;
+      on the "cleaned" path this should be a no-op, since clean_dataset
+      already resolved every missing value in the feature columns)
+    - one-hot encodes the categorical features (sex, c_charge_degree)
+    - splits into train/test, stratified on the target
 
-This is intentionally the weakest part of the pipeline:
-    - missing values are simply dropped (no imputation strategy)
-    - categorical columns are one-hot encoded with no thought given to unseen categories or cardinality
-    - a single train/test split is used (no cross-validation)
-
-You will replace this with something better in the coming weeks.
-
-One thing that is NOT naive, on purpose: `sensitive_attr` (race) is kept out of the model's input features entirely. It's split alongside the data so it's still available afterwards -- not to train on, but to check whether the model treats different groups differently. See src/evaluate.py:fairness_report.
+`sensitive_attr` (race) and any `extra_audit_columns` (score_text) are
+kept aside for the fairness audit -- split alongside the data so they line
+up with the test set, but never used as a model input.
 """
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -16,27 +20,21 @@ from sklearn.model_selection import train_test_split
 
 def preprocess(
     df: pd.DataFrame,
+    features: list,
     target: str,
     sensitive_attr: str,
-    drop_columns: list,
+    extra_audit_columns: list,
     test_size: float,
     random_state: int,
 ):
-    # naive: just drop rows with any missing values
-    df = df.dropna()
+    audit_columns = [sensitive_attr] + list(extra_audit_columns)
+    required_columns = features + [target] + audit_columns
+    df = df.dropna(subset=[c for c in required_columns if c in df.columns])
 
     y = df[target]
+    extras = df[audit_columns].copy()  # kept aside for the fairness audit, never a model input
 
-    # kept aside for fairness auditing after training -- never used as a model input
-    extras = df[[sensitive_attr, "score_text"]].copy()
-
-    columns_to_exclude = [target, sensitive_attr] + [
-        c for c in drop_columns if c in df.columns
-    ]
-    X = df.drop(columns=columns_to_exclude)
-
-    # naive: one-hot encode all non-numeric columns, no further thought
-    X = pd.get_dummies(X, drop_first=True)
+    X = pd.get_dummies(df[features], drop_first=True)
 
     X_train, X_test, y_train, y_test, extras_train, extras_test = train_test_split(
         X, y, extras, test_size=test_size, random_state=random_state, stratify=y
