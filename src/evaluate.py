@@ -1,100 +1,89 @@
-"""Evaluation -- single train/test split, no cross-validation (yet)."""
+"""Evaluating a model honestly: cross-validation of the whole pipeline,
+out-of-fold predictions, and the fairness audit computed on them."""
+import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import classification_report
+from sklearn.model_selection import cross_validate
 
 
-def evaluate(y_train, y_train_pred, y_test, y_pred) -> str:
+def cross_validate_pipeline(pipeline, X, y, cv, scoring: str = "accuracy", n_jobs: int = 1):
     """
-    Prints -- and returns as text, so it can also be saved to disk -- train accuracy and test accuracy side by side, plus the usual classification report on the test set.
-    """
-    train_accuracy = accuracy_score(y_train, y_train_pred)
-    test_accuracy = accuracy_score(y_test, y_pred)
-    gap = train_accuracy - test_accuracy
+    Fits a fresh copy of `pipeline` on each fold's training part and scores it on that
+    fold's validation part. Because `pipeline` contains the preprocessing too, imputation
+    medians, encoder statistics and scaler means are re-learned inside every fold -- the
+    validation fold never influences its own preprocessing.
 
+    Returns (fold_scores, y_oof):
+      - fold_scores: one row per fold -- train score, validation score, and the gap between
+        them (a large, consistent gap = overfitting).
+      - y_oof: out-of-fold predictions. Every row gets a prediction from the one fold model
+        that did NOT train on it, so all of them are "unseen" -- what the classification
+        report and fairness check are computed on (more rows than one test split, and the
+        locked test set stays untouched). Taken from the same fits as the scores, so
+        nothing is fitted twice.
+    """
+    scores = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, return_train_score=True,
+                            return_estimator=True, return_indices=True, n_jobs=n_jobs)
+    fold_scores = pd.DataFrame({
+        "fold": range(1, len(scores["test_score"]) + 1),
+        "train": scores["train_score"],
+        "validation": scores["test_score"],
+    })
+    fold_scores["gap"] = fold_scores["train"] - fold_scores["validation"]
+
+    y_oof = np.empty(len(X), dtype=np.asarray(y).dtype)
+    for model, val_idx in zip(scores["estimator"], scores["indices"]["test"]):
+        y_oof[val_idx] = model.predict(X.iloc[val_idx])
+    return fold_scores, y_oof
+
+
+def cv_report(fold_scores: pd.DataFrame, scoring: str = "accuracy") -> str:
+    """Per-fold table + mean +/- std, as text (printed, and saved to results/)."""
     lines = [
-        f"Train accuracy: {train_accuracy:.3f}",
-        f"Test accuracy:  {test_accuracy:.3f}",
-        f"Gap (train - test): {gap:+.3f}",
+        f"Cross-validation ({len(fold_scores)} stratified folds, metric: {scoring})",
+        "",
+        fold_scores.to_string(index=False, float_format=lambda v: f"{v:.3f}"),
+        "",
     ]
-    lines.append("")
-    lines.append("Classification report (test set):")
-    lines.append(classification_report(y_test, y_pred))
-
+    for col in ["train", "validation", "gap"]:
+        sign = "+" if col == "gap" else ""
+        lines.append(f"{col.capitalize():<11s} mean = {fold_scores[col].mean():{sign}.3f}   "
+                     f"std = {fold_scores[col].std(ddof=1):.3f}")
     text = "\n".join(lines)
     print(text)
     return text
 
 
-def compare_before_after(runs: list) -> str:
-    """
-    Week 3: summarizes accuracy and fairness before (raw/naive
-    preprocessing) vs after (clean_dataset) cleaning, for every model that
-    was run on both. `runs` is a list of dicts, one per (dataset, model)
-    combination, each with at minimum:
-        dataset ("raw" or "cleaned"), model, train_accuracy, test_accuracy,
-        n_rows, n_features, fpr_gap (max - min false positive rate across
-        race groups, our model, on the test set)
-    """
-    lines = ["Before (raw) vs after (cleaned) -- summary", "=" * 60, ""]
-
-    by_model = {}
-    for r in runs:
-        by_model.setdefault(r["model"], {})[r["dataset"]] = r
-
-    header = f"{'Model':<22s} {'Dataset':<10s} {'Rows':>6s} {'Feats':>6s} {'Train acc':>10s} {'Test acc':>9s} {'FPR gap':>8s}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    for model_name, variants in by_model.items():
-        for dataset in ("raw", "cleaned"):
-            r = variants.get(dataset)
-            if r is None:
-                continue
-            lines.append(
-                f"{model_name:<22s} {dataset:<10s} {r['n_rows']:>6d} {r['n_features']:>6d} "
-                f"{r['train_accuracy']:>10.3f} {r['test_accuracy']:>9.3f} {r['fpr_gap']:>8.3f}"
-            )
-        if "raw" in variants and "cleaned" in variants:
-            acc_delta = variants["cleaned"]["test_accuracy"] - variants["raw"]["test_accuracy"]
-            fpr_delta = variants["cleaned"]["fpr_gap"] - variants["raw"]["fpr_gap"]
-            lines.append(
-                f"    -> cleaning changed test accuracy by {acc_delta:+.3f} "
-                f"and the FPR gap by {fpr_delta:+.3f}"
-            )
-        lines.append("")
-
-    text = "\n".join(lines)
+def oof_classification_report(y_true, y_pred) -> str:
+    """Classification report on the out-of-fold predictions."""
+    text = "Classification report (out-of-fold predictions, development set):\n" + \
+        classification_report(y_true, y_pred, zero_division=0)
     print(text)
     return text
 
 
-def fairness_report(y_test, y_pred, extras_test: pd.DataFrame, sensitive_attr: str = "race"):
+def fairness_report(y_true, y_pred, extras: pd.DataFrame, sensitive_attr: str = "race") -> str:
     """
-    Deliberately simple fairness check -- not a substitute for a real audit, just enough to show that "accuracy" and "fair" are not the same thing.
+    Deliberately simple fairness check -- not a substitute for a real audit, just enough
+    to show that "accurate" and "fair" are not the same thing.
 
-    For each race group, prints (and returns as text) the false
-    positive rate (share of people who did NOT reoffend but were
-    predicted to) for:
-        - our own model
-        - COMPAS's own risk score (score_text is anything other than "low", case-insensitively, counts as a "high risk" prediction), for comparison
-
-    Returns (text, our_model_fpr_gap), where the gap is the spread
-    (max - min) of our model's own false-positive rate across race
-    groups on this test set -- a single number that compare_before_after
-    can track across the before/after and model comparisons without
-    re-parsing the printed text.
+    For each race group, the false positive rate (share of people who did NOT reoffend
+    but were predicted to) for:
+        - our own model (out-of-fold predictions on the development set)
+        - COMPAS's own risk score (score_text != "Low" counts as a "high risk"
+          prediction), on the same rows, for comparison
     """
-    df = extras_test.copy()
-    df["y_true"] = y_test.values
+    df = extras.copy()
+    df["y_true"] = pd.Series(y_true).values
     df["y_pred_model"] = y_pred
-    df["y_pred_compas"] = (df["score_text"].astype(str).str.lower() != "low").astype(int)
+    df["y_pred_compas"] = (df["score_text"] != "Low").astype(int)
 
     lines = [
-        "False positive rate by race",
+        "False positive rate by race (development set, out-of-fold)",
         "(share of people who did NOT reoffend, but were predicted to)",
         "",
     ]
 
-    our_model_fprs = []
     for label, col in [("Our model", "y_pred_model"), ("COMPAS's own score", "y_pred_compas")]:
         lines.append(f"  {label}:")
         for group, g in df.groupby(sensitive_attr):
@@ -103,12 +92,8 @@ def fairness_report(y_test, y_pred, extras_test: pd.DataFrame, sensitive_attr: s
                 continue
             fpr = (negatives[col] == 1).mean()
             lines.append(f"    {group:<20s} FPR = {fpr:.2f}  (n={len(negatives)})")
-            if col == "y_pred_model":
-                our_model_fprs.append(fpr)
         lines.append("")
 
     text = "\n".join(lines)
     print(text)
-
-    fpr_gap = (max(our_model_fprs) - min(our_model_fprs)) if our_model_fprs else float("nan")
-    return text, fpr_gap
+    return text

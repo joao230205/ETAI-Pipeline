@@ -10,6 +10,8 @@ Across both models and both feature sets (with/without `race`), cleaning cost al
 The reason: on the raw path, uncleaned category variants (`"felony"`/`"f"`, placeholder tokens) fragment both the model's features and the fairness audit's groups. Cleaning doesn't add predictive signal -- it removes noise that was inflating raw accuracy through overfitting to duplicate categories, while letting the fairness audit finally group the same people together.
 
 **Bottom line:** for this dataset, cleaning is nearly free in accuracy and clearly worthwhile for fairness.
+
+Conclusão (week 4): a validação cruzada confirma o modelo escolhido nas semanas 2-3 -- a logistic regression continua a ser a melhor opção, com o menor gap treino-validação (praticamente zero) e a accuracy mais estável entre folds. A comparação holdout vs. CV mostra também porque a avaliação de uma única divisão não chega: os valores de holdout (uma única partição) e a média de CV diferem até 0.02 no mesmo modelo, só por causa de qual 25% calhou na validação -- é essa instabilidade que a CV existe para resolver. A decision tree e o random forest continuam a sobreajustar (gap de +0.10 e +0.09), o que sustenta a decisão de não os escolher sem antes limitar a sua complexidade.
 ## Overview
 
 Predicts `two_year_recid` -- whether a defendant will be rearrested within

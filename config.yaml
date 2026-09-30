@@ -4,44 +4,122 @@
 data:
   path: "data/compas_two_year_recidivism.csv"
   target: "two_year_recid"
-  sensitive_attr: "race"          # excluded from model features; reserved for the fairness audit
-  extra_audit_columns: ["score_text"]  # kept alongside race for the audit, never used as a feature
+  sensitive_attr: "race"          # excluded from model features, used only to audit fairness
+  # kept in the data but never used as model features: the row id and COMPAS's own score
+  # (the redundant columns are removed earlier, by clean_dataset() -- see diagnostics.redundant_columns)
+  drop_columns: ["id", "decile_score", "score_text"]
 
-  # Explicit feature allowlist (chosen from the EDA's correlation/association
-  # analysis -- see README "Preprocessing decisions"):
-  #   - decile_score / score_text: excluded -- target leakage (they're COMPAS's
-  #     own prediction, Cramer's V 0.93 with each other and the highest
-  #     association of anything with the target)
-  #   - age_cat: excluded -- Cramer's V 0.88 with age, which carries the same
-  #     information without discretizing it away
-  #   - id: excluded -- identifier, no predictive meaning
-  #   - race: excluded from features on purpose -- see sensitive_attr above
-  features:
-    - age
-    - priors_count
-    - juv_fel_count
-    - juv_misd_count
-    - juv_other_count
-    - sex
-    - c_charge_degree
-    - race
-
-split:
-  test_size: 0.2
+# Week 4: the FINAL TEST SET. Carved out once, stratified, and locked: never used to fit,
+# tune, compare or choose anything. Used only for the final assessment.
+# Do not change these two values after week 4 -- a new seed would silently give you a
+# different (already partly "seen") test set.
+test_set:
+  size: 0.2
   random_state: 42
 
-# Comparing before (raw/naive) vs after (cleaned) preprocessing, across both
-# models -- main.py loops over every entry here for each dataset variant.
-models:
-  logistic_regression:
-    type: "logistic_regression"
-    params:
-      max_iter: 1000
-  decision_tree:
-    type: "decision_tree"
-    params:
-      max_depth: 1000        # unchanged from week 2 -- still a deliberately weak spot (see README);
-      random_state: 42       # this week's fix is the preprocessing, not the tree's own overfitting
+# Week 4: how models are evaluated -- stratified k-fold cross-validation on the
+# development set (everything except the locked test set). Same random_state = same folds on
+# every run, for every model, so comparisons are like-for-like.
+cv:
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  scoring: "accuracy"   # one metric for now, so numbers compare directly with weeks 2-3
+  n_jobs: 1             # folds fitted in parallel; -1 = all cores (only pays off for slow models, e.g. random forest)
+
+# The week 3 diagnosis, written down as cleaning rules (see 01_eda_introduction.ipynb /
+# JupyterNootebook_Cleaning.ipynb for how each of these was found).
+# clean_dataset() in src/preprocessing.py reads everything below, so it never hardcodes COMPAS's column names.
+diagnostics:
+  id_column: "id"
+  # columns that load as text purely because a placeholder token (see placeholder_tokens below)
+  # shows up somewhere in them
+  numeric_text_columns: ["priors_count", "prior_offenses"]
+  placeholder_tokens: ["-", "?", "n/a", "N/A", "na", "NA", "", "nan"]
+  validity_rules:
+    age: {min: 18, max: 100}
+    decile_score: {min: 1, max: 10}
+    juv_fel_count: {min: 0}
+    # the real distribution is continuous 0-38; 250/500 (each appearing exactly 3 times) sit
+    # in a hard gap above that -- sentinel values, not genuine counts (see README)
+    priors_count: {min: 0, max: 60}
+  # one direct lowercase-key -> canonical-label map per column: handles case/whitespace AND
+  # real aliases ("felony"/"f", "african american"/"african-american") in a single step
+  canonical_categories:
+    sex:
+      male: "Male"
+      female: "Female"
+    race:
+      african-american: "African-American"
+      african american: "African-American"
+      caucasian: "Caucasian"
+      hispanic: "Hispanic"
+      other: "Other"
+      asian: "Asian"
+      native american: "Native American"
+    c_charge_degree:
+      f: "F"
+      felony: "F"
+      m: "M"
+      misdemeanor: "M"
+    score_text:
+      low: "Low"
+      medium: "Medium"
+      high: "High"
+  # multicollinearity casualties (prior_offenses == priors_count; age_in_months == age * 12;
+  # juvenile_total == sum of the 3 juvenile counters -- confirmed row by row) -- dropped by
+  # clean_dataset(), so they never reach the features
+  redundant_columns: ["prior_offenses", "age_in_months", "juvenile_total"]
+
+# The preprocessing recipe (week 4). Every step here is FITTED on training rows only, inside
+# the model's Pipeline. Encoder and scaler are chosen by hand (reasons below).
+preprocessing:
+  # options: "onehot" | "ordinal" | "count" | "target"
+  encoder: "target"      # compact (1 column per feature) and informative; sklearn's version cross-fits, so no leak
+  # options: "none" | "standard" | "minmax" | "robust"
+  scaler: "robust"       # median/IQR: the few extreme counts (e.g. priors_count) don't set the scale for everyone
+  numeric_features: ["age", "juv_fel_count", "juv_misd_count", "juv_other_count", "priors_count"]
+  # age_cat excluded on purpose: Cramer's V 0.88 with age, which already carries that
+  # information continuously instead of discretized -- see README "Preprocessing decisions"
+  categorical_features: ["sex", "c_charge_degree"]
+  # week 3 verdict: priors_count and c_charge_degree are MNAR (missingness carries information),
+  # age/juv_fel_count/sex are MCAR (a plain fill loses nothing) -- so only these two get a flag
+  mnar_indicator_sources: ["priors_count", "c_charge_degree"]
+  # seed for the target encoder's internal cross-fitting (sklearn's TargetEncoder)
+  random_state: 42
+  imputation:
+    numeric_strategy: "median"        # applies to age, juv_fel_count, juv_misd_count, juv_other_count, priors_count
+    categorical_strategy: "most_frequent"   # applies to sex, c_charge_degree
+
+model:
+  # one of: "dummy" (majority-class floor), "logistic_regression", "decision_tree", "random_forest"
+  #type: "logistic_regression"
+  #params:
+    #max_iter: 2000
+  # Random Forest example -- swap the two lines above for these to run it:
+  # type: "random_forest"
+  # params:
+  #   n_estimators: 300
+  #   random_state: 42
+  #   n_jobs: -1
+  # dummy
+#model:
+  #type: "dummy"
+  #params: {}
+
+# decision tree
+#model:
+  #type: "decision_tree"
+  #params:
+    #random_state: 42
+
+# random forest (já tens este exemplo comentado no fim do config.yaml)
+model:
+  type: "random_forest"
+  params:
+    n_estimators: 300
+    random_state: 42
+    n_jobs: -1
 
 output:
   results_dir: "results"   # each run's full report is saved here as a timestamped .txt file
