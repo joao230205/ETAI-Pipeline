@@ -88,35 +88,33 @@ preprocessing:
   # seed for the target encoder's internal cross-fitting (sklearn's TargetEncoder)
   random_state: 42
   imputation:
-    numeric_strategy: "median"        # applies to age, juv_fel_count, juv_misd_count, juv_other_count, priors_count
+    # options: "mean" | "median" | "knn" -- applies to age, juv_fel_count, juv_misd_count,
+    # juv_other_count, priors_count. "knn" fills a gap from the n_neighbors most similar rows
+    # (after scaling -- see build_preprocessor) instead of a single column-wide statistic.
+    numeric_strategy: "median"
+    knn_n_neighbors: 5    # only used when numeric_strategy is "knn"
     categorical_strategy: "most_frequent"   # applies to sex, c_charge_degree
 
 model:
   # one of: "dummy" (majority-class floor), "logistic_regression", "decision_tree", "random_forest"
   #type: "logistic_regression"
   #params:
-    #max_iter: 2000
-  # Random Forest example -- swap the two lines above for these to run it:
-  # type: "random_forest"
-  # params:
-  #   n_estimators: 300
-  #   random_state: 42
-  #   n_jobs: -1
-  # dummy
-#model:
+   # max_iter: 2000
+  
+
   #type: "dummy"
   #params: {}
 
 # decision tree
-#model:
+
   #type: "decision_tree"
   #params:
-    #random_state: 42
+   # random_state: 42
 
-# random forest (já tens este exemplo comentado no fim do config.yaml)
-model:
-  type: "random_forest"
-  params:
+  #random forest 
+
+   type: "random_forest"
+   params:
     n_estimators: 300
     random_state: 42
     n_jobs: -1

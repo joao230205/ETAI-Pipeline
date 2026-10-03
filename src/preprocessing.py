@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
+from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import (
     OneHotEncoder, OrdinalEncoder, TargetEncoder, StandardScaler, MinMaxScaler, RobustScaler,
@@ -182,10 +182,25 @@ def build_preprocessor(preprocessing_config: dict) -> ColumnTransformer:
     scaler = scaler_factory() if callable(scaler_factory) else scaler_factory
     encoder = _ENCODERS[encoder_name](preprocessing_config.get("random_state"))
 
-    numeric_pipeline = Pipeline([
-        ("impute", SimpleImputer(strategy=imputation.get("numeric_strategy", "median"))),
-        ("scale", scaler),
-    ])
+    numeric_strategy = imputation.get("numeric_strategy", "median")
+    if numeric_strategy == "knn":
+        # KNNImputer fills a gap from the k most similar rows, measured by distance across
+        # every numeric column -- so the columns must already be on a comparable scale, or
+        # whichever one has the largest raw range (e.g. priors_count vs juv_fel_count)
+        # would dominate every distance calculation. Scale FIRST, then impute on the
+        # scaled values (the opposite order from the median/mean path below).
+        numeric_pipeline = Pipeline([
+            ("scale", scaler),
+            ("impute", KNNImputer(n_neighbors=imputation.get("knn_n_neighbors", 5))),
+        ])
+    else:
+        # median/mean don't care about scale, so impute first, then scale -- this also
+        # means the imputed value itself (e.g. the column median) is computed from the
+        # original units, which is easier to sanity-check than a scaled one.
+        numeric_pipeline = Pipeline([
+            ("impute", SimpleImputer(strategy=numeric_strategy)),
+            ("scale", scaler),
+        ])
     categorical_pipeline = Pipeline([
         ("impute", SimpleImputer(strategy=imputation.get("categorical_strategy", "most_frequent"))),
         ("encode", encoder),
