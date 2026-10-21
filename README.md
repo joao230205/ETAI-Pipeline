@@ -41,7 +41,8 @@ on.
 │   ├── data.py             # loading
 │   ├── cleaning.py         # clean_dataset -- category cleanup, domain rules, dedup, redundant columns
 │   ├── preprocessing.py    # train/test split + one-hot encode
-│   ├── model.py             # model construction
+│   ├── model.py             # model construction + build_pipeline (preprocessing + model)
+│   ├── tuning.py           # Optuna tuning + nested cross-validation
 │   ├── evaluate.py         # accuracy metrics + fairness check + before/after comparison
 │   └── results.py          # saves each run's report to disk
 ├── results/                # created automatically -- one file per run (not tracked in git)
@@ -58,6 +59,10 @@ This table is updated after each practical class, so you can always see what cha
 |------|------------------------|------------------------|
 | 2 | Introduction & baseline pipeline | Initial version: project structure, a single naive train/test split (no cross-validation), minimal preprocessing (drop rows with missing values, one-hot encode categoricals), logistic regression baseline, a first (deliberately simple) fairness check comparing our model's and COMPAS's own false-positive rate by race, train-vs-test accuracy reporting (to start spotting overfitting), and each run's full report saved automatically to `results/` |
 | 3 | From EDA to a validated cleaning recipe | Full EDA in `01_eda_introduction.ipynb`: missingness (including hidden placeholder tokens `"-"`/`"?"`), category aliases beyond simple case/whitespace (`"felony"`→`"f"`, `"african american"`→`"african-american"`), domain-rule violations, an outlier gap in `priors_count` (38 → 250/500, clearly sentinel values), a `decile_score`/`score_text` mutual-consistency check, redundant/multicollinear columns, and a full pairwise association matrix (Pearson + Cramer's V + correlation ratio) used to pick the final feature set. `clean_dataset()`, in its own `src/cleaning.py`, applies every one of these decisions (see "Preprocessing decisions" below). `main.py` runs **both** the naive path (`preprocess()` only, on the raw data) and the cleaned path (`clean_dataset()` then `preprocess()`) through **both** models and prints/saves a before-vs-after comparison table (`evaluate.compare_before_after`). See "Preprocessing decisions" and "Best model" below for what that comparison found. |
+| 4 | Leak-free evaluation | Preprocessing and model joined in one sklearn `Pipeline`, cross-validated as a whole (stratified 5-fold) on the development set; a locked test set that no run touches; out-of-fold classification report and fairness audit. |
+| 5 | Hyperparameter tuning | `src/tuning.py`: Optuna (seeded TPE sampler) searches the hyperparameters of the whole Pipeline, with search spaces in `config.yaml` (`tuning:`). The score to report comes from **nested CV** (tuning repeated inside each outer fold), plus an optimism check (tuning score minus honest score). |
+| 6 | Ensembles | New models: `oblique_random_forest` (random forest whose trees split on random linear combinations of features) and `adaboost` (boosted trees of tunable depth). Their search spaces are in `config.yaml`. |
+| 7 | Metrics and boosting | New models `gradient_boosting`, `hist_gradient_boosting`, `naive_bayes`. Several metrics per fold (`cv.metrics`), `roc_auc` as the selection metric, out-of-fold probabilities instead of labels, `class_weight: balanced` where the model supports it, a floor (dummy) and an untuned score for comparison, and a scoreboard `results/runs.csv` with one row per run. |
 
 ## Environment setup
 
@@ -177,6 +182,49 @@ the raw and cleaned data (4 runs total). Latest comparison:
 - **Feature count dropped from 56 to 7** -- the cleaned path's one-hot encoding only has `sex` and `c_charge_degree` (2 categories each) to expand, since `priors_count` is now a proper numeric column instead of ~40 text categories.
 - **COMPAS's own score reproduces the original ProPublica finding**, independent of our cleaning: on the cleaned data, COMPAS's false-positive rate is 0.40 for African-American defendants vs. 0.25 for Caucasian defendants -- a real gap in the *label everyone is trying to predict/compare against*, not an artifact of our preprocessing.
 - **Current best model: logistic regression on cleaned data.** It has the smallest train/test gap of the four runs (0.031, vs. 0.159 for the decision tree on the same data) and the best fairness result on real, correctly-grouped categories, at only a small accuracy cost versus its raw-data score. The decision tree still overfits heavily even on cleaned data (`max_depth: 1000` is still a deliberately unbounded, unfixed weak spot -- see the pipeline progress table) -- fixing that is next week's job, not this week's.
+
+## Hyperparameter tuning (week 5)
+
+Every number is ROC AUC (the selection metric, see week 7) on the development set, with the same stratified 5-fold split for every model. "Tuned" is the **nested CV** score (30 Optuna trials inside each outer fold), so the tuned model is always scored on rows that took no part in the choice. "Tuning score" is the best trial of the final study on all development rows; "Optimism" is the tuning score inside the outer folds minus the honest outer score.
+
+| Model | Default CV (mean ± std) | Tuned nested CV (mean ± std) | Tuning score (best trial) | Optimism | Chosen hyperparameters |
+|---|---|---|---|---|---|
+| Decision tree | 0.596 ± 0.013 | 0.713 ± 0.012 | 0.717 | +0.004 | `max_depth=7`, `min_samples_leaf=87`, `criterion=gini` |
+| Logistic regression | 0.719 ± 0.014 | 0.718 ± 0.014 | 0.719 | +0.001 | `C=0.0034` |
+| Random forest | 0.664 ± 0.015 | 0.725 ± 0.014 | 0.726 | -0.000 | `max_depth=7`, `min_samples_leaf=56`, `max_features=0.5` |
+
+Tuning matters most for the models that overfit by default: the decision tree goes from 0.596 to 0.713 just by limiting its depth and leaf size, and the random forest from 0.664 to 0.725. Logistic regression gains nothing (0.719 to 0.718): its default was already close to the best, and the search only chose a much stronger regularisation (`C=0.0034`) with the same score. The optimism is tiny for every model (at most +0.004), so with 30 trials and 5 inner folds the best trial's score is a fair estimate here; the nested score is still the one to report. Note that once the trees are regularised the gap between very different models almost disappears (all within about 0.01), which suggests this feature set limits the score more than the choice of model does.
+
+## Ensembles (week 6)
+
+| Model | Default CV (mean ± std) | Tuned nested CV (mean ± std) | Tuning score (best trial) | Chosen hyperparameters |
+|---|---|---|---|---|
+| Logistic regression | 0.719 ± 0.014 | 0.718 ± 0.014 | 0.719 | `C=0.0034` |
+| Decision tree | 0.596 ± 0.013 | 0.713 ± 0.012 | 0.717 | `max_depth=7`, `min_samples_leaf=87`, `gini` |
+| Random forest | 0.664 ± 0.015 | 0.725 ± 0.014 | 0.726 | `max_depth=7`, `min_samples_leaf=56`, `max_features=0.5` |
+| Oblique random forest | 0.669 ± 0.012 | 0.723 ± 0.014 | 0.726 | tree `max_depth=7`, `min_samples_leaf=55`, `n_components=4` |
+| AdaBoost | 0.720 ± 0.012 | 0.727 ± 0.013 | 0.728 | tree `max_depth=4`, `n_estimators=220`, `learning_rate=0.025` |
+
+Averaging many trees (bagging) fixes most of the single tree's variance, and the forests end up about 0.01 above it, but tuned they are still only on par with logistic regression, so on this small, mostly low-signal feature set the extra flexibility buys little. The oblique forest, whose splits are random linear combinations of the features, does not beat the axis-aligned forest (0.723 vs 0.725, well inside one standard deviation): with only 7 mostly weak features there is little for oblique splits to exploit. AdaBoost is the best of this group, and it chose depth-4 trees with a small learning rate, i.e. a slow, regularised boosting rather than stumps. Its untuned score (0.720, stumps) was already good, which fits boosting needing little tuning to work.
+
+## Metrics and scoreboard (week 7)
+
+`python main.py` now appends one row per run to `results/runs.csv` (floor, untuned and honest score, fold scores, chosen hyperparameters), and reports accuracy, balanced accuracy, precision, recall, F1, F2, ROC AUC and average precision for every run (see the `results/run_<id>.txt` files). Scoreboard on ROC AUC, higher is better; "Tuned" is nested CV with 30 trials, "Untuned" uses the hyperparameters written in `config.yaml`:
+
+| Model | Floor (dummy) | Untuned (CV) | Tuned (nested CV, mean ± std) |
+|---|---|---|---|
+| Dummy | 0.500 | 0.500 | - |
+| Logistic regression | 0.500 | 0.719 | 0.718 ± 0.014 |
+| Naive Bayes | 0.500 | 0.684 | 0.715 ± 0.011 |
+| Decision tree | 0.500 | 0.596 | 0.713 ± 0.012 |
+| Random forest | 0.500 | 0.664 | 0.725 ± 0.014 |
+| Oblique random forest | 0.500 | 0.669 | 0.723 ± 0.014 |
+| AdaBoost | 0.500 | 0.720 | 0.727 ± 0.013 |
+| Gradient boosting | 0.500 | 0.725 | 0.728 ± 0.014 |
+
+**Why ROC AUC is the selection metric.** Accuracy depends on one decision threshold (0.5) and on the class balance (45% reoffend), and it hides how the model ranks people. ROC AUC judges the ranking of the predicted probabilities, is threshold-free, and the threshold can then be chosen separately for the cost of each kind of error (for example F2 or recall if missing a reoffender matters more than a false alarm). It also lets the dummy floor be exactly 0.5, so every model's gain over doing nothing is obvious.
+
+**Reading the board.** The boosting models are the top group (0.727-0.728), followed closely by the forests and logistic regression (0.718-0.725); the differences are smaller than one fold standard deviation (about 0.013), so none of them is clearly better than the others on this data. Because of that, simplicity should break the tie: logistic regression is within noise of the best model and is the easiest to explain and audit, which matters for a fairness-sensitive problem like COMPAS. The test set stays locked until a final model is chosen.
 
 ## Dataset
 
