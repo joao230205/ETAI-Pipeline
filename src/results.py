@@ -36,10 +36,20 @@ def save_run(results_dir: str, run: str, config: dict, report_text: str) -> str:
     model_cfg = config["model"]
     cv_cfg = config["cv"]
     test_cfg = config["test_set"]
+    sel_cfg = config.get("feature_selection", {})
+    selection = (f"vote (min_votes={sel_cfg.get('min_votes', 2)}"
+                 f"{', tuned' if config.get('tuning', {}).get('enabled') else ''})"
+                 if sel_cfg.get("enabled") else "none")
+    imputation = config["preprocessing"].get("imputation", {})
 
     header = "\n".join([
         f"Run: {run}",
+        f"Data: {config['data']['path']}  |  target: {config['data']['target']}",
         f"Model: {model_cfg['type']}  params: {model_cfg.get('params', {})}",
+        f"Feature selection: {selection}",
+        f"Preprocessing: encoder={config['preprocessing']['encoder']}, scaler={config['preprocessing']['scaler']}, "
+        f"numeric imputer={imputation.get('numeric_strategy', 'median')}, "
+        f"categorical imputer={imputation.get('categorical_strategy', 'most_frequent')}",
         f"CV: {cv_cfg['n_splits']}-fold stratified "
         f"(shuffle={cv_cfg.get('shuffle', True)}, random_state={cv_cfg.get('random_state')})",
         f"Metrics: {cv_cfg['metrics']}  |  selection metric: {cv_cfg['selection_metric']}",

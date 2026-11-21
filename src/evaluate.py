@@ -87,29 +87,34 @@ def oof_classification_report(y_true, oof_proba, threshold: float = 0.5) -> str:
 
 
 def fairness_report(y_true, oof_proba, extras: pd.DataFrame, sensitive_attr: str = "race",
-                    threshold: float = 0.5) -> str:
+                    threshold: float = 0.5, baseline: dict = None) -> str:
     """
     Deliberately simple fairness check -- not a substitute for a real audit, just enough
     to show that "accurate" and "fair" are not the same thing.
 
-    For each group of `sensitive_attr`, the false positive rate (share of people who did NOT
-    reoffend but were predicted to) for:
+    For each group of `sensitive_attr`, the false positive rate (share of truly negative
+    people -- on COMPAS: who did NOT reoffend -- who were predicted positive) for:
         - our own model (out-of-fold predictions on the development set)
-        - COMPAS's own risk score (score_text != "Low" counts as a "high risk"
-          prediction), on the same rows, for comparison
+        - optionally an external score on the same rows, for comparison (`baseline`, from
+          config `data.baseline_score`: e.g. COMPAS's own score_text, where anything other
+          than "Low" counts as a positive prediction). Week 9: no longer hardcoded, so a
+          dataset without such a score (Adult) gets the model's rates only.
     """
     df = extras.copy()
     df[sensitive_attr] = df[sensitive_attr].fillna("unknown")
     df["y_true"] = pd.Series(y_true).values
     df["y_pred_model"] = (np.asarray(oof_proba) >= threshold).astype(int)
-    df["y_pred_compas"] = (df["score_text"] != "Low").astype(int)
+    rows = [("Our model", "y_pred_model")]
+    if baseline and baseline.get("column") in df.columns:
+        df["y_pred_baseline"] = (df[baseline["column"]] != baseline["negative_value"]).astype(int)
+        rows.append((baseline.get("label", baseline["column"]), "y_pred_baseline"))
 
     lines = [
         f"False positive rate by {sensitive_attr} (development set, out-of-fold, threshold={threshold})",
-        "(share of people who did NOT reoffend, but were predicted to)",
+        "(share of truly negative people who were predicted positive)",
         "",
     ]
-    for label, col in [("Our model", "y_pred_model"), ("COMPAS's own score", "y_pred_compas")]:
+    for label, col in rows:
         lines.append(f"  {label}:")
         for group, g in df.groupby(sensitive_attr):
             negatives = g[g["y_true"] == 0]

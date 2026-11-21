@@ -1,0 +1,113 @@
+# Week 9 (option A): the same pipeline on a different dataset -- UCI Adult income.
+# Run with:   python main.py --config config_adult.yaml
+# Nothing in src/ names an Adult column: everything Adult-specific lives in this file.
+
+data:
+  path: "data/adult_train.csv"
+  target: "income_over_50k"         # 1 = earns more than 50K a year (~24% of rows)
+  # audited attribute: sex. race is the second sensitive attribute -- kept out of the features
+  # too, the same "fairness through unawareness" choice as for COMPAS (see README "Beyond COMPAS")
+  sensitive_attr: "sex"
+  # never features: the row id, the census sampling weight (how many people a row represents,
+  # not a characteristic of the person) and the other sensitive attribute
+  drop_columns: ["id", "fnlwgt", "race"]
+  # no external score to compare against in the fairness report (COMPAS has score_text)
+  baseline_score: null
+
+test_set:
+  size: 0.2
+  random_state: 42
+
+cv:
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  metrics: ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "fbeta_2", "roc_auc", "average_precision"]
+  selection_metric: "roc_auc"
+  n_jobs: 1
+
+# The diagnosis from 09_beyond_compas.ipynb, section 2.2, written as rules (no code names Adult's columns)
+diagnostics:
+  id_column: "id"
+  numeric_text_columns: []
+  # "?" means unknown in workclass (379), occupation (381) and native_country (86);
+  # clean_dataset() now turns these tokens into NaN in EVERY text column, not only canonical ones
+  placeholder_tokens: ["?", "-", "n/a", "N/A", "na", "NA", "", "nan"]
+  validity_rules:                   # Adult's own rules (COMPAS's age >= 18 would erase 74 valid 17-year-olds)
+    age: {min: 17, max: 90}
+    hours_per_week: {min: 1, max: 99}
+    capital_gain: {min: 0}          # 99999 is the census top code ("99999 or more"), real -- not made missing
+    capital_loss: {min: 0}
+  canonical_categories: {}          # the category spellings are already consistent
+  # education is the same information as education_num, one to one ("Bachelors" is always 13);
+  # education_num keeps the order
+  redundant_columns: ["education"]
+
+preprocessing:
+  encoder: "target"                 # native_country has 41 values (many with < 5 people): one-hot -> ~40 columns
+  scaler: "robust"
+  numeric_features: ["age", "education_num", "capital_gain", "capital_loss", "hours_per_week",
+                     "v01", "v02", "v03", "v04", "v05", "v06", "v07", "v08", "v09",
+                     "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"]
+  categorical_features: ["workclass", "marital_status", "occupation", "relationship", "native_country",
+                         "v19", "v20", "v21", "v22", "v23", "v24", "v25"]
+  # the same people are missing in workclass and occupation, and they earn > 50K half as often
+  # (12% vs 25%): the gap carries information, so it gets a flag. native_country / v01-v06: no pattern
+  mnar_indicator_sources: ["workclass", "occupation"]
+  random_state: 42
+  imputation:
+    numeric_strategy: "median"      # median | mean | knn | iterative | random_forest
+    categorical_strategy: "most_frequent"
+    n_neighbors: 5                  # knn
+    max_iter: 10                    # iterative, random_forest
+    n_estimators: 50                # random_forest (trees per column)
+
+model:
+  type: "xgboost"
+  params:
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 4
+    random_state: 42
+    n_jobs: -1
+
+feature_selection:
+  enabled: true
+  min_votes: 2
+  random_state: 42
+  search_space:
+    select__min_votes: {type: int, low: 1, high: 3}
+
+tuning:
+  enabled: true
+  n_trials: 30
+  n_splits: 5
+  random_state: 42
+  search_spaces:
+    logistic_regression:
+      model__C: {type: float, low: 0.0001, high: 100.0, log: true}
+    random_forest:
+      model__max_depth: {type: int, low: 2, high: 30}
+      model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
+      model__max_features: {type: categorical, choices: ["sqrt", 0.5, 1.0]}
+    hist_gradient_boosting:
+      model__max_iter: {type: int, low: 25, high: 500, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.5, log: true}
+      model__max_leaf_nodes: {type: int, low: 2, high: 63, log: true}
+      model__min_samples_leaf: {type: int, low: 5, high: 200, log: true}
+      model__l2_regularization: {type: float, low: 0.000001, high: 10.0, log: true}
+    xgboost:
+      model__n_estimators: {type: int, low: 50, high: 600, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.3, log: true}
+      model__max_depth: {type: int, low: 1, high: 8}
+      model__min_child_weight: {type: float, low: 1.0, high: 50.0, log: true}
+      model__subsample: {type: float, low: 0.5, high: 1.0}
+      model__colsample_bytree: {type: float, low: 0.5, high: 1.0}
+      model__reg_lambda: {type: float, low: 0.01, high: 10.0, log: true}
+      model__reg_alpha: {type: float, low: 0.001, high: 10.0, log: true}
+      model__gamma: {type: float, low: 0.0, high: 5.0}
+
+output:                             # its own folders, so Adult runs never mix with COMPAS runs
+  results_dir: "results_adult"
+  scoreboard: "results_adult/runs.csv"
+  model_path: "models/adult_model.joblib"

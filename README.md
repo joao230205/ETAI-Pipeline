@@ -34,20 +34,25 @@ on.
 
 ```
 .
-├── main.py                # entry point: run the whole pipeline
-├── config.yaml             # all tunable settings live here
+├── main.py                # entry point: clean, evaluate (CV / nested CV), refit, save the model
+├── predict.py             # predicts a new CSV with the saved model (week 10)
+├── config.yaml            # all tunable settings for COMPAS live here
+├── config_adult.yaml      # the same pipeline on the Adult income data (week 9)
 ├── requirements.txt
 ├── src/
 │   ├── data.py             # loading
-│   ├── cleaning.py         # clean_dataset -- category cleanup, domain rules, dedup, redundant columns
-│   ├── preprocessing.py    # train/test split + one-hot encode
-│   ├── model.py             # model construction + build_pipeline (preprocessing + model)
+│   ├── preprocessing.py    # clean_dataset (row-preserving), drop_duplicate_rows (training only),
+│   │                       # feature/target split, locked test set, build_preprocessor (imputers, encoders, scalers)
+│   ├── model.py            # the models, VoteSelector (feature selection), build_pipeline (prep + select + model)
 │   ├── tuning.py           # Optuna tuning + nested cross-validation
-│   ├── evaluate.py         # accuracy metrics + fairness check + before/after comparison
-│   └── results.py          # saves each run's report to disk
-├── results/                # created automatically -- one file per run (not tracked in git)
+│   ├── evaluate.py         # scorers, CV of the whole pipeline, reports, fairness audit, corrected paired test
+│   └── results.py          # saves each run's report and the scoreboard (runs.csv)
+├── results/, results_adult/  # created automatically -- reports + scoreboard per config (not tracked in git)
+├── models/                 # created automatically -- the saved pipelines (not tracked in git)
+├── predictions_adult.csv   # predictions for data/adult_new.csv (week 9)
 └── data/
-    ├── compas_two_year_recidivism.csv
+    ├── compas_two_year_recidivism.csv, compas_new_people.csv
+    ├── adult_train.csv, adult_new.csv, ADULT_README.md
     └── README.md            # problem description + full data dictionary
 ```
 
@@ -63,6 +68,9 @@ This table is updated after each practical class, so you can always see what cha
 | 5 | Hyperparameter tuning | `src/tuning.py`: Optuna (seeded TPE sampler) searches the hyperparameters of the whole Pipeline, with search spaces in `config.yaml` (`tuning:`). The score to report comes from **nested CV** (tuning repeated inside each outer fold), plus an optimism check (tuning score minus honest score). |
 | 6 | Ensembles | New models: `oblique_random_forest` (random forest whose trees split on random linear combinations of features) and `adaboost` (boosted trees of tunable depth). Their search spaces are in `config.yaml`. |
 | 7 | Metrics and boosting | New models `gradient_boosting`, `hist_gradient_boosting`, `naive_bayes`. Several metrics per fold (`cv.metrics`), `roc_auc` as the selection metric, out-of-fold probabilities instead of labels, `class_weight: balanced` where the model supports it, a floor (dummy) and an untuned score for comparison, and a scoreboard `results/runs.csv` with one row per run. |
+| 8 | XGBoost and feature selection | New model `xgboost` (with its search space, including the new brakes `gamma`, `reg_alpha`, `reg_lambda`, `min_child_weight`). New learned step `VoteSelector` between preprocessing and model (a random forest, gradient boosting and an L1 logistic regression vote; a feature needs `min_votes` votes), switched on in `config.yaml` (`feature_selection`), re-fitted inside every fold, and with tuning on `select__min_votes` is tuned together with the model (nested CV). The pipeline caches fitted steps in a temporary folder per run, so tuning doesn't refit the selector in every trial. The features kept are printed and recorded. Also fixed: the week-7 `main.py` had been saved in `src/` by mistake. See "Feature selection". |
+| 9 | Beyond COMPAS (option A: Adult income) | `config_adult.yaml` runs the same pipeline on a new dataset (`python main.py --config config_adult.yaml`), with its own output folders. Fixed the COMPAS-only assumptions it exposed: placeholder tokens now become missing in every text column (not only the listed ones), and the COMPAS score in the fairness report is a config setting (`data.baseline_score`) instead of a hardcoded `score_text`. COMPAS gives exactly the same cleaning as before. Predictions for `adult_new.csv` in `predictions_adult.csv`. See "Beyond COMPAS". |
+| 10 | Missing values and deployment | The numeric imputer is a setting (`imputation.numeric_strategy`: `median`, `mean`, `knn`, `iterative` (MICE), `random_forest` (missForest)); numeric columns are now scaled first, then imputed. `main.py` saves the final fitted pipeline (`models/model.joblib`), and the new `predict.py` predicts a new CSV from the terminal with no training, one row out per row in. See "Missing values" and "Predicting new data". |
 
 ## Environment setup
 
@@ -122,19 +130,21 @@ folder, on any OS:
 python main.py
 ```
 
-This loads `config.yaml`, loads the raw data, runs it through both the raw
-(naive) and cleaned (`clean_dataset()`) preprocessing paths, trains every
-model listed under `config.yaml`'s `models` section on each path, and
-prints, per (dataset, model) combination:
-- **train accuracy and test accuracy, side by side.** Comparing the two is how you catch overfitting: if the model looks much better on the data it was trained on than on data it's never seen, it has memorised rather than learned something that generalises. 
-- a classification report on the test set
-- a false-positive-rate-by-race comparison between our model and
-  COMPAS's own score
+```bash
+python main.py                                                    # COMPAS (config.yaml)
+python main.py --config config_adult.yaml                         # Adult income (week 9)
+python predict.py data/compas_new_people.csv predictions.csv      # predict new people (week 10)
+```
 
-...then a before-vs-after summary table across all four runs (see "Best
-model" below).
+`main.py` loads the config, cleans the data (`clean_dataset()`, row-preserving), drops duplicate
+rows (training data only), sets aside the **locked test set** (never touched), and evaluates the
+model in `model.type` on the development set:
+- the floor (a dummy model) and the model with the hyperparameters in the config, by stratified 5-fold CV of the whole Pipeline (preprocessing + feature selection + model);
+- with `tuning.enabled`, Optuna tuning scored honestly by **nested CV** (the number to report);
+- every metric in `cv.metrics`, a classification report and the fairness audit on the out-of-fold predictions;
+- the final pipeline refit on every development row, the **features it kept**, and the pipeline saved to `output.model_path` for `predict.py`.
 
-All of this is also saved to a timestamped file in `results/` (e.g.`results/run_20260916_143012.txt`), so it doesn't just scroll past in your terminal -- open it later, or change something in `config.yaml` (like the model type) and compare the new file to the last one.
+Each run adds one row to the scoreboard (`results/runs.csv`) and writes its full report to `results/run_<id>.txt`, so it doesn't just scroll past in your terminal.
 `results/` is created automatically the first time you run the
 pipeline, and isn't tracked in git (see `.gitignore`) since it's
 generated output, not source.
@@ -225,6 +235,78 @@ Averaging many trees (bagging) fixes most of the single tree's variance, and the
 **Why ROC AUC is the selection metric.** Accuracy depends on one decision threshold (0.5) and on the class balance (45% reoffend), and it hides how the model ranks people. ROC AUC judges the ranking of the predicted probabilities, is threshold-free, and the threshold can then be chosen separately for the cost of each kind of error (for example F2 or recall if missing a reoffender matters more than a false alarm). It also lets the dummy floor be exactly 0.5, so every model's gain over doing nothing is obvious.
 
 **Reading the board.** The boosting models are the top group (0.727-0.728), followed closely by the forests and logistic regression (0.718-0.725); the differences are smaller than one fold standard deviation (about 0.013), so none of them is clearly better than the others on this data. Because of that, simplicity should break the tie: logistic regression is within noise of the best model and is the easiest to explain and audit, which matters for a fairness-sensitive problem like COMPAS. The test set stays locked until a final model is chosen.
+
+## Feature selection (week 8)
+
+XGBoost, tuned (30 Optuna trials, nested CV, ROC AUC), the same folds, with and without the `VoteSelector`. With selection on, `select__min_votes` is tuned together with the model.
+
+| Run | Features used | Untuned (CV) | Tuned (nested CV, mean ± std) |
+|---|---|---|---|
+| XGBoost, no selection | 9 (all) | 0.723 | 0.728 ± 0.015 |
+| XGBoost + `VoteSelector` | 2: `age`, `priors_count` | 0.721 | 0.725 ± 0.013 |
+
+Corrected paired t-test (Nadeau & Bengio), selection minus no selection: **-0.002, t = -1.17, p = 0.31**.
+
+The two-feature model is as good as the nine-feature one: the difference is about a fifth of a fold standard deviation and the corrected test is nowhere near significant, so dropping seven of nine features costs nothing measurable. That fits everything since week 5: `age` and `priors_count` carry almost all the signal, and the juvenile counts, sex, charge degree and the two missingness flags add little on top. Nested CV chose `min_votes = 1` for the final model and it still kept only those two -- the other columns didn't get a single vote. I would keep selection **on**: the same score with a model that only looks at age and criminal history is much easier to explain and audit, and it also means the model no longer uses `sex` at all, which matters for a fairness-sensitive problem like this one. The cost is a slower run (the selector fits three models per fold), which the cache keeps reasonable (about 2.5 minutes per tuned run here).
+
+## Beyond COMPAS (week 9, option A: Adult income)
+
+**Run it:** `python main.py --config config_adult.yaml` (results in `results_adult/`, model in `models/adult_model.joblib`), then `python predict.py data/adult_new.csv predictions_adult.csv --config config_adult.yaml`.
+
+Decisions in `config_adult.yaml`, all from the data card: `sex` is the audited attribute; `race` is kept out of the features as well (the same "fairness through unawareness" choice as for COMPAS); `fnlwgt` (a sampling weight) and `id` are never features; `education` is redundant with `education_num`; `workclass` and `occupation` get a missingness flag (the same people are missing in both and earn > 50K half as often); Adult's own validity rules (age 17-90, so the 74 seventeen-year-olds survive). The 25 undocumented `v` columns all go in, and feature selection decides.
+
+**What broke, why, and how it was fixed:**
+
+| What broke | Why | Fix |
+|---|---|---|
+| `"?"` survived cleaning as a real category in `workclass`, `occupation` and `native_country` (silently -- no error) | `_canonicalize_categories()` only turns placeholders into missing values in the columns listed in `canonical_categories`; on COMPAS every text column happened to be listed | `clean_dataset()` now turns `placeholder_tokens` into NaN in **every** text column. After cleaning: 379 / 381 / 86 missing, as expected |
+| ...and so the `workclass_was_missing` / `occupation_was_missing` flags were all 0 | the flag looks for NaN, and there was none | fixed by the same change |
+| `KeyError: 'score_text'` in the fairness report | the comparison with COMPAS's own score was hardcoded (`df["score_text"] != "Low"`), and `split_features_target()` also named `score_text` | the external score is a setting, `data.baseline_score` (COMPAS: `{column: score_text, negative_value: Low}`; Adult: `null`), and the report shows it only when it exists |
+| the fairness report said "did NOT reoffend" | COMPAS wording in a general function | neutral wording: "share of truly negative people who were predicted positive" |
+| `canonical_categories: {}` / missing | assumed every dataset needs a category map | treated as empty |
+
+Check: COMPAS's cleaned data is **identical** to before (`DataFrame.equals` on the old and new `clean_dataset()` output), so the COMPAS runs are unchanged. `main.py` already took `--config` (week 7).
+
+**Results** (development set, 5-fold CV; tuned = nested CV, 30 trials; target scores: ROC AUC ≥ 0.90, accuracy ≥ 0.855, F1 ≥ 0.66):
+
+| Run | Features kept | ROC AUC | Accuracy | F1 (class 1) |
+|---|---|---|---|---|
+| Floor (dummy) | - | 0.500 | 0.76 | 0.00 |
+| Logistic regression + selection, untuned | 8 | 0.896 ± 0.015 | 0.847 | 0.640 |
+| XGBoost, no selection, tuned | 37 (all) | 0.906 ± 0.015 | 0.859 | 0.661 |
+| XGBoost + selection, tuned (`config_adult.yaml`) | 8 | 0.908 ± 0.015 | **0.856** | **0.668** |
+| **XGBoost + selection, untuned** (n_estimators 300, learning rate 0.05, depth 4) | 8 | **0.913 ± 0.016** | **0.864** | **0.686** |
+
+Both XGBoost runs with selection reach all three targets in the same run; the untuned one is the best on every metric. Corrected paired tests on ROC AUC: tuned with vs without selection +0.002 (p = 0.26); tuned vs untuned (both with selection) -0.005 (p = 0.07) -- neither difference is significant.
+
+**Features kept (8):** `age`, `education_num`, `capital_gain`, `capital_loss`, `hours_per_week`, `marital_status`, `occupation`, `relationship`. **None of the 25 `v` columns**, and neither `workclass`, `native_country` nor the two missingness flags. `predictions_adult.csv` holds `id`, `probability` and `prediction` for all 2,000 rows of `adult_new.csv` (19% predicted > 50K), from the saved tuned model.
+
+The hardest assumption to find was the placeholder one, because nothing failed: `"?"` simply became a category and the missingness flags stayed at 0, and the model still scored well, so only checking `value_counts()` after cleaning showed it (the `KeyError` on `score_text`, by contrast, announced itself). What got the targets was a flexible model plus selection: logistic regression misses accuracy and F1, and XGBoost on all 37 columns only scrapes past F1 (0.661) because the 25 noise-like `v` columns cost it a little; with selection it keeps the eight real census features and clears all three targets. Tuning did not help here (0.908 vs 0.913, within noise): the hand-picked hyperparameters were already good, and nested CV is honest about the tuner not finding better. On fairness: `sex` is not a feature, but `relationship` (`Husband` / `Wife`) and `marital_status` carry it almost entirely, and the model wrongly predicts > 50K for 9% of men who don't earn it vs 2% of women -- leaving the sensitive attribute out does not make a model blind to it.
+
+## Missing values (week 10)
+
+The numeric imputer is now a setting (`preprocessing.imputation.numeric_strategy`). None of the options uses the target (filling a gap "by class" would leak the label in CV and can't run on a new person, who has no label), so all of them run unchanged in `predict.py`. XGBoost with the configured hyperparameters (tuning off), same folds, ROC AUC:
+
+| Imputer | With selection (2 features kept) | p vs median | Without selection (9 features) | p vs median |
+|---|---|---|---|---|
+| `median` (default) | 0.721 ± 0.013 | - | 0.723 ± 0.017 | - |
+| `knn` (5 neighbours) | 0.721 ± 0.010 | 0.94 | 0.721 ± 0.013 | 0.49 |
+| `iterative` (MICE) | 0.721 ± 0.013 | 0.92 | 0.724 ± 0.017 | 0.82 |
+| `random_forest` (missForest) | 0.721 ± 0.013 | 0.95 | 0.723 ± 0.015 | 0.99 |
+
+(p = corrected paired t-test against `median` on the same folds.) Run times: median / knn / iterative under 15 s, random_forest about 90 s.
+
+No imputer is better than the median: every difference is at most 0.003 with p ≥ 0.49. That's what the class notebook predicted: a model-based imputer is only as good as the columns it sees, and our five numeric columns say very little about each other (the juvenile counts don't tell you someone's age, and nothing predicts `priors_count` well). I keep **`median`**: same score, the fastest, nothing to tune, and the easiest to explain; the `_was_missing` flags already carry the information in the gaps that matter (`priors_count`, `c_charge_degree`). Note that the numeric columns are now scaled before they are imputed (needed for KNN); with the median this gives the same CV score as before (0.721 untuned, 0.725 tuned).
+
+## Predicting new data (week 10)
+
+```bash
+python main.py                                                    # train, evaluate, save models/model.joblib
+python predict.py data/compas_new_people.csv predictions.csv      # predict, no training
+python predict.py data/adult_new.csv predictions_adult.csv --config config_adult.yaml
+```
+
+`main.py` saves the final fitted pipeline (cleaning rules aside: imputer statistics, encoder, scaler, selected features and model) to `output.model_path`. `predict.py` cleans the new file with the same `clean_dataset()` rules but **without** `drop_duplicate_rows()`, so every row gets an answer, and writes a CSV with one row per input row: `id`, `probability` (of the positive class: reoffending within two years / earning > 50K) and `prediction` (1 if the probability is ≥ 0.5). On `compas_new_people.csv`: 20 rows in, 20 rows out -- the `"?"` in `priors_count` and the missing age are filled by the saved imputer, the never-seen charge degree `"X"` doesn't crash the encoder, and the same person entered twice gets the same prediction twice. It stops with a clear message if the input lacks a column the model needs. A `.joblib` file should only be loaded with the same library versions it was saved with, and only if you trust it (loading can run code).
 
 ## Dataset
 
